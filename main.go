@@ -1,14 +1,25 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
+
+	"gopkg.in/ini.v1"
 )
+
+// 配置结构体
+type Config struct {
+	TargetHost    string `ini:"target_host"`
+	ListeningPort string `ini:"listening_port"`
+}
 
 // fileExists 检查文件是否存在且不是一个目录
 func fileExists(filename string) bool {
@@ -24,69 +35,107 @@ func fileExists(filename string) bool {
 	return !info.IsDir()
 }
 
-func handler(w http.ResponseWriter, r *http.Request) {
+func handler(w http.ResponseWriter, r *http.Request, targetHost string) {
 	// 检查请求的文件是否存在于 web 文件夹中
 	webDir := "web"
+	uri := r.RequestURI
+	fmt.Println("请求:", uri)
 	requestedFile := filepath.Join(webDir, r.URL.Path)
-	fmt.Println("请求文件:", requestedFile)
-
-	if fileExists(requestedFile) {
-		fmt.Print("本地文件存在,返回本地文件")
+	if uri == "/" {
+		requestedFile = filepath.Join(webDir, "/index.html")
+	}
+	if strings.Contains(r.URL.Path, "reqproc") {
+		forwardRequest(r, w, targetHost)
+	} else if fileExists(requestedFile) {
+		// fmt.Println("请求文件:", requestedFile)
+		if r.URL.Path == "/index.html" {
+			r.URL.Path = "/"
+		}
 		http.ServeFile(w, r, requestedFile)
 	} else {
-		fmt.Println("未找到本地文件,转发请求到 192.168.0.1")
-		forwardRequest(r, w)
+		fmt.Println("未找到本地文件,转发请求到 192.168.100.1")
+		forwardRequest(r, w, targetHost)
 	}
 }
 
-func forwardRequest(r *http.Request, w http.ResponseWriter) {
-	// 创建目标服务器的新 URL
-	targetURL, err := url.Parse("http://192.168.0.1")
+func forwardRequest(r *http.Request, w http.ResponseWriter, targetHost string) {
+	// 解析目标服务器的 URL
+	targetURL, err := url.Parse("http://" + targetHost + r.URL.Path)
 	if err != nil {
-		fmt.Println("解析目标 URL 时出错:", err)
-		http.Error(w, "内部服务器错误", http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// 拼接完整的目标 URL
-	targetURL.Path = r.URL.Path
-	targetURL.RawQuery = r.URL.RawQuery
+	if r.Method == http.MethodGet {
+		// 对于 GET 请求，将查询参数附加到目标 URL
+		queryParams := r.URL.Query()
+		targetURL.RawQuery = targetURL.RawQuery + "&" + queryParams.Encode()
+	}
 
-	// 使用 http.Client 发送请求
+	// 复制原始请求到新请求
+	newReq, err := http.NewRequest(r.Method, targetURL.String(), nil)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// 复制原始请求的头部信息和主体内容
+	newReq.Header = r.Header
+	newReq.GetBody = r.GetBody // GetBody 是 http.Request 的一个方法，用于获取请求体
+
+	// 特殊处理 GET 和 POST 请求
+	if r.Method == http.MethodPost {
+		// 对于 POST 请求，根据 Content-Type 处理请求体
+		bodyBytes, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer r.Body.Close()
+
+		newReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		newReq.ContentLength = int64(len(bodyBytes))
+	}
+
+	// 发送请求到目标服务器
 	client := &http.Client{}
-	req, err := http.NewRequest(r.Method, targetURL.String(), r.Body)
+	resp, err := client.Do(newReq)
 	if err != nil {
-		fmt.Println("创建新请求时出错:", err)
-		http.Error(w, "内部服务器错误", http.StatusInternalServerError)
-		return
-	}
-
-	// 从原始请求复制头部信息到新请求
-	for k, v := range r.Header {
-		req.Header[k] = v
-	}
-
-	// 发送请求并读取响应
-	resp, err := client.Do(req)
-	if err != nil {
-		fmt.Println("发送请求时出错:", err)
-		http.Error(w, "内部服务器错误", http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	defer resp.Body.Close()
 
-	// 将响应复制回客户端
-	for k, v := range resp.Header {
-		w.Header()[k] = v
+	// 读取响应内容
+	respBody, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+
+	// 将响应内容写回客户端
+	w.Write(respBody)
 }
 
 func main() {
-	http.HandleFunc("/", handler)
-	fmt.Println("启动过滤代理服务，监听 8080 端口...")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
+	cfg, err := ini.Load("config.ini")
+	if err != nil {
+		log.Fatalf("无法读取配置文件: %v", err)
+	}
+
+	var config Config
+	err = cfg.Section("server").MapTo(&config)
+	if err != nil {
+		log.Fatalf("无法解析配置: %v", err)
+	}
+
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		handler(w, r, config.TargetHost)
+	})
+
+	// http.HandleFunc("/", handler, config.TargetHost)
+	fmt.Println("启动过滤代理服务，监听 " + config.ListeningPort + " 端口...")
+	if err := http.ListenAndServe(":"+config.ListeningPort, nil); err != nil {
 		log.Fatal("ListenAndServe: ", err)
 	}
 }
