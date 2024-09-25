@@ -44,7 +44,7 @@ func handler(w http.ResponseWriter, r *http.Request, targetHost string) {
 	if uri == "/" {
 		requestedFile = filepath.Join(webDir, "/index.html")
 	}
-	if strings.Contains(r.URL.Path, "reqproc") {
+	if strings.Contains(r.URL.Path, "reqproc") || strings.Contains(r.URL.Path, "goform") {
 		forwardRequest(r, w, targetHost)
 	} else if fileExists(requestedFile) {
 		// fmt.Println("请求文件:", requestedFile)
@@ -53,7 +53,7 @@ func handler(w http.ResponseWriter, r *http.Request, targetHost string) {
 		}
 		http.ServeFile(w, r, requestedFile)
 	} else {
-		fmt.Println("未找到本地文件,转发请求到 192.168.100.1")
+		fmt.Println("未找到本地文件,转发请求到 " + targetHost)
 		forwardRequest(r, w, targetHost)
 	}
 }
@@ -134,7 +134,7 @@ func main() {
 	})
 
 	// http.HandleFunc("/", handler, config.TargetHost)
-	fmt.Println("启动过滤代理服务，监听 " + config.ListeningPort + " 端口...")
+	fmt.Println("启动过滤代理服务目标服务器：" + config.TargetHost + "，监听 " + config.ListeningPort + " 端口...")
 	if err := http.ListenAndServe(":"+config.ListeningPort, nil); err != nil {
 		log.Fatal("ListenAndServe: ", err)
 	}
